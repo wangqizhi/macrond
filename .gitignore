@@ -1,0 +1,28 @@
+# Rust
+/target/
+Cargo.lock
+
+# macOS / system
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*.tmp
+
+# AI / tooling artifacts
+.codex/
+.cursor/
+.github/copilot/
+
+# Local runtime data
+jobs/
+logs/
+run/
+target/
