@@ -73,6 +73,11 @@ macrond stop
 ```
 
 ## 5. CLI 使用
+不带子命令直接运行会默认进入 TUI：
+```bash
+macrond
+```
+
 ```bash
 # 列出任务
 macrond list
@@ -105,6 +110,8 @@ macrond tui
 ```
 
 首页快捷键：
+- `h` / `Left`：焦点到 Jobs
+- `l` / `Right`：焦点到 History Runs
 - `j/k`：上下移动
 - `a`：新增任务
 - `e` 或 `Enter`：编辑任务

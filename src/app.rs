@@ -15,7 +15,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let paths = AppPaths::new(&cli.base_dir)?;
     paths.ensure_dirs()?;
 
-    match cli.command {
+    match cli.command.unwrap_or(Command::Tui) {
         Command::Version => version(),
         Command::Start => start(&paths),
         Command::Stop => stop(&paths),

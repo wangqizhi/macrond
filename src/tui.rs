@@ -46,8 +46,16 @@ struct UiState {
     history_runs: Vec<String>,
     daemon_pid: Option<i32>,
     selected: usize,
+    history_selected: usize,
+    focus: ListFocus,
     message: String,
     mode: UiMode,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ListFocus {
+    Jobs,
+    History,
 }
 
 enum UiMode {
@@ -130,6 +138,8 @@ impl UiState {
             history_runs,
             daemon_pid,
             selected: 0,
+            history_selected: 0,
+            focus: ListFocus::Jobs,
             message: "Ready".to_string(),
             mode: UiMode::List,
         })
@@ -144,6 +154,11 @@ impl UiState {
         } else if self.selected >= self.jobs.len() {
             self.selected = self.jobs.len() - 1;
         }
+        if self.history_runs.is_empty() {
+            self.history_selected = 0;
+        } else if self.history_selected >= self.history_runs.len() {
+            self.history_selected = self.history_runs.len() - 1;
+        }
         Ok(())
     }
 
@@ -156,6 +171,11 @@ impl UiState {
         } else if self.selected >= self.jobs.len() {
             self.selected = self.jobs.len() - 1;
         }
+        if self.history_runs.is_empty() {
+            self.history_selected = 0;
+        } else if self.history_selected >= self.history_runs.len() {
+            self.history_selected = self.history_runs.len() - 1;
+        }
         Ok(())
     }
 
@@ -164,20 +184,44 @@ impl UiState {
     }
 
     fn next(&mut self) {
-        if self.jobs.is_empty() {
-            return;
+        match self.focus {
+            ListFocus::Jobs => {
+                if self.jobs.is_empty() {
+                    return;
+                }
+                self.selected = (self.selected + 1) % self.jobs.len();
+            }
+            ListFocus::History => {
+                if self.history_runs.is_empty() {
+                    return;
+                }
+                self.history_selected = (self.history_selected + 1) % self.history_runs.len();
+            }
         }
-        self.selected = (self.selected + 1) % self.jobs.len();
     }
 
     fn previous(&mut self) {
-        if self.jobs.is_empty() {
-            return;
-        }
-        if self.selected == 0 {
-            self.selected = self.jobs.len() - 1;
-        } else {
-            self.selected -= 1;
+        match self.focus {
+            ListFocus::Jobs => {
+                if self.jobs.is_empty() {
+                    return;
+                }
+                if self.selected == 0 {
+                    self.selected = self.jobs.len() - 1;
+                } else {
+                    self.selected -= 1;
+                }
+            }
+            ListFocus::History => {
+                if self.history_runs.is_empty() {
+                    return;
+                }
+                if self.history_selected == 0 {
+                    self.history_selected = self.history_runs.len() - 1;
+                } else {
+                    self.history_selected -= 1;
+                }
+            }
         }
     }
 
@@ -197,11 +241,23 @@ impl UiState {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('j') | KeyCode::Down => self.next(),
             KeyCode::Char('k') | KeyCode::Up => self.previous(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = ListFocus::Jobs;
+                self.message = "Focus: Jobs".to_string();
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.focus = ListFocus::History;
+                self.message = "Focus: History Runs".to_string();
+            }
             KeyCode::Char('r') => {
                 self.reload(paths)?;
                 self.message = format!("Reloaded {} jobs", self.jobs.len());
             }
             KeyCode::Char('a') => {
+                if self.focus != ListFocus::Jobs {
+                    self.message = "Switch focus to Jobs to add/edit/delete".to_string();
+                    return Ok(false);
+                }
                 let mut id = generate_job_id();
                 while job_file_path(&paths.jobs_dir, &id).exists() {
                     id = generate_job_id();
@@ -209,6 +265,10 @@ impl UiState {
                 self.mode = UiMode::Edit(EditState::new(JobForm::new(id), "Creating new job"));
             }
             KeyCode::Char('s') => {
+                if self.focus != ListFocus::Jobs {
+                    self.message = "Switch focus to Jobs to toggle job".to_string();
+                    return Ok(false);
+                }
                 if let Some(job_id) = self.selected_job().map(|j| j.id.clone()) {
                     let current = load_job_by_id(&paths.jobs_dir, &job_id)?;
                     let next_enabled = !current.enabled;
@@ -228,6 +288,10 @@ impl UiState {
                 }
             }
             KeyCode::Char('t') => {
+                if self.focus != ListFocus::Jobs {
+                    self.message = "Switch focus to Jobs to test job".to_string();
+                    return Ok(false);
+                }
                 if let Some(job_id) = self.selected_job().map(|j| j.id.clone()) {
                     self.message = run_test(paths, &job_id)?;
                 } else {
@@ -243,6 +307,10 @@ impl UiState {
                 self.reload(paths)?;
             }
             KeyCode::Char('e') => {
+                if self.focus != ListFocus::Jobs {
+                    self.message = "Switch focus to Jobs to edit job".to_string();
+                    return Ok(false);
+                }
                 if let Some(job) = self.selected_job() {
                     self.mode = UiMode::Edit(EditState::new(JobForm::from_job(job), "Editing job"));
                 } else {
@@ -250,13 +318,25 @@ impl UiState {
                 }
             }
             KeyCode::Enter => {
-                if let Some(job) = self.selected_job() {
-                    self.mode = UiMode::Edit(EditState::new(JobForm::from_job(job), "Editing job"));
+                if self.focus == ListFocus::Jobs {
+                    if let Some(job) = self.selected_job() {
+                        self.mode = UiMode::Edit(EditState::new(JobForm::from_job(job), "Editing job"));
+                    } else {
+                        self.message = "No job selected".to_string();
+                    }
                 } else {
-                    self.message = "No job selected".to_string();
+                    self.message = self
+                        .history_runs
+                        .get(self.history_selected)
+                        .cloned()
+                        .unwrap_or_else(|| "No history line selected".to_string());
                 }
             }
             KeyCode::Char('d') => {
+                if self.focus != ListFocus::Jobs {
+                    self.message = "Switch focus to Jobs to delete job".to_string();
+                    return Ok(false);
+                }
                 if let Some(job) = self.selected_job() {
                     self.mode = UiMode::ConfirmDelete {
                         job_id: job.id.clone(),
@@ -775,7 +855,7 @@ fn render(frame: &mut Frame<'_>, ui: &UiState) {
 
     let help = match &ui.mode {
         UiMode::List => {
-            "j/k:move  a:add  e/Enter:edit  d:delete  s:toggle job  t:test job  S:start daemon  X:stop daemon  r:refresh  q:quit\nTip: add/edit stays inside this TUI frame."
+            "h/Left:focus jobs  l/Right:focus history  j/k:move  a:add  e/Enter:edit  d:delete  s:toggle job  t:test job  S:start daemon  X:stop daemon  r:refresh  q:quit\nHistory focus: Enter shows selected full line in Status."
         }
         UiMode::Edit(edit) => {
             if edit.input.is_some() {
@@ -819,23 +899,58 @@ fn render_list(frame: &mut Frame<'_>, area: ratatui::layout::Rect, ui: &UiState)
             .collect()
     };
 
+    let jobs_block = if ui.focus == ListFocus::Jobs {
+        Block::default()
+            .title("Jobs (focused)")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+    } else {
+        Block::default().title("Jobs").borders(Borders::ALL)
+    };
     let jobs = List::new(job_items)
-        .block(Block::default().title("Jobs").borders(Borders::ALL))
+        .block(jobs_block)
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol(" > ");
     frame.render_stateful_widget(jobs, body[0], &mut state);
 
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(body[1]);
+
+    let mut history_state = ListState::default().with_selected(Some(ui.history_selected));
     let run_items: Vec<ListItem<'_>> = if ui.history_runs.is_empty() {
         vec![ListItem::new("No history log lines.")]
     } else {
         ui.history_runs
             .iter()
-            .take(12)
+            .take(100)
             .map(|line| ListItem::new(line.clone()))
             .collect()
     };
-    let runs = List::new(run_items).block(Block::default().title("History Runs").borders(Borders::ALL));
-    frame.render_widget(runs, body[1]);
+    let history_block = if ui.focus == ListFocus::History {
+        Block::default()
+            .title("History Runs (focused)")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+    } else {
+        Block::default().title("History Runs").borders(Borders::ALL)
+    };
+    let runs = List::new(run_items)
+        .block(history_block)
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol(" > ");
+    frame.render_stateful_widget(runs, right[0], &mut history_state);
+
+    let detail = ui
+        .history_runs
+        .get(ui.history_selected)
+        .cloned()
+        .unwrap_or_else(|| "No history line selected".to_string());
+    let detail_widget = Paragraph::new(detail)
+        .block(Block::default().title("History Detail").borders(Borders::ALL))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(detail_widget, right[1]);
 }
 
 fn render_edit(frame: &mut Frame<'_>, area: ratatui::layout::Rect, edit: &EditState) {

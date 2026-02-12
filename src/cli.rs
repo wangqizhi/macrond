@@ -8,7 +8,7 @@ pub struct Cli {
     pub base_dir: PathBuf,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
