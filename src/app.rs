@@ -16,6 +16,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     paths.ensure_dirs()?;
 
     match cli.command {
+        Command::Version => version(),
         Command::Start => start(&paths),
         Command::Stop => stop(&paths),
         Command::Status => status(&paths),
@@ -25,6 +26,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Tui => tui::run_tui(&paths),
         Command::Daemon => daemon::run_daemon(paths).await,
     }
+}
+
+fn version() -> Result<()> {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    Ok(())
 }
 
 fn start(paths: &AppPaths) -> Result<()> {

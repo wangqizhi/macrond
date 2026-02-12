@@ -3,7 +3,7 @@ use crate::logging;
 use crate::model::{DaemonState, ExecutionRecord, JobConfig, JobView};
 use crate::paths::AppPaths;
 use crate::scheduler;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::Local;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -197,8 +197,13 @@ fn collect_requests(requests_dir: &Path) -> Result<Vec<String>> {
 
 fn spawn_job(job: JobConfig, trigger: &'static str, paths: AppPaths, tx: mpsc::Sender<ExecutionRecord>) {
     tokio::spawn(async move {
-        if let Ok(record) = execute_job(paths, job, trigger).await {
-            let _ = tx.send(record).await;
+        match execute_job(paths.clone(), job, trigger).await {
+            Ok(record) => {
+                let _ = tx.send(record).await;
+            }
+            Err(err) => {
+                let _ = logging::log_daemon(&paths.logs_dir, "ERROR", &format!("execute_job failed: {err:#}"));
+            }
         }
     });
 }
@@ -206,17 +211,19 @@ fn spawn_job(job: JobConfig, trigger: &'static str, paths: AppPaths, tx: mpsc::S
 async fn execute_job(paths: AppPaths, job: JobConfig, trigger: &str) -> Result<ExecutionRecord> {
     let run_id = Uuid::new_v4().to_string();
     let started_at = Local::now();
+    let (mut command, command_line) = build_command(&job);
 
     logging::log_job(
         &paths.logs_dir,
         "INFO",
         &job.id,
         &run_id,
-        &format!("event=start trigger={trigger} command={}", job.command.program),
+        &format!(
+            "event=start trigger={trigger} command=\"{command_line}\" timeout_seconds={}",
+            job.timeout_seconds
+        ),
     )?;
 
-    let mut command = Command::new(&job.command.program);
-    command.args(&job.command.args);
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
@@ -226,31 +233,60 @@ async fn execute_job(paths: AppPaths, job: JobConfig, trigger: &str) -> Result<E
     command.envs(&job.command.env);
 
     let timeout = Duration::from_secs(job.timeout_seconds.max(1));
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn failed for job {}", job.id))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let ended_at = Local::now();
+            let message = format!("event=failed stage=spawn command=\"{command_line}\" error={err}");
+            logging::log_job(&paths.logs_dir, "ERROR", &job.id, &run_id, &message)?;
+            return Ok(ExecutionRecord {
+                run_id,
+                job_id: job.id,
+                trigger: trigger.to_string(),
+                started_at,
+                ended_at,
+                status: "failed".to_string(),
+                exit_code: None,
+                message,
+            });
+        }
+    };
 
     let (status, exit_code, message) = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(exit)) => {
             if exit.success() {
-                ("success".to_string(), exit.code(), "event=success".to_string())
+                (
+                    "success".to_string(),
+                    exit.code(),
+                    format!(
+                        "event=success command=\"{command_line}\" exit_code={}",
+                        exit.code().unwrap_or(0)
+                    ),
+                )
             } else {
                 (
                     "failed".to_string(),
                     exit.code(),
-                    format!("event=failed exit_code={}", exit.code().unwrap_or(-1)),
+                    format!(
+                        "event=failed command=\"{command_line}\" exit_code={}",
+                        exit.code().unwrap_or(-1)
+                    ),
                 )
             }
         }
         Ok(Err(err)) => (
             "failed".to_string(),
             None,
-            format!("event=failed message=wait-error:{err}"),
+            format!("event=failed command=\"{command_line}\" message=wait-error:{err}"),
         ),
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            ("timeout".to_string(), None, "event=timeout".to_string())
+            (
+                "timeout".to_string(),
+                None,
+                format!("event=timeout command=\"{command_line}\""),
+            )
         }
     };
 
@@ -267,6 +303,39 @@ async fn execute_job(paths: AppPaths, job: JobConfig, trigger: &str) -> Result<E
         exit_code,
         message,
     })
+}
+
+fn build_command(job: &JobConfig) -> (Command, String) {
+    let shell_mode = job.command.args.is_empty() && looks_like_shell(&job.command.program);
+    if shell_mode {
+        let script = job.command.program.clone();
+        let mut command = Command::new("/bin/bash");
+        command.arg("-lc").arg(&script);
+        (command, format!("/bin/bash -lc {}", shell_escape(&script)))
+    } else {
+        let mut command = Command::new(&job.command.program);
+        command.args(&job.command.args);
+        let mut full = job.command.program.clone();
+        for arg in &job.command.args {
+            full.push(' ');
+            full.push_str(&shell_escape(arg));
+        }
+        (command, full)
+    }
+}
+
+fn looks_like_shell(program: &str) -> bool {
+    [' ', '|', '>', '<', ';', '&', '`', '$']
+        .iter()
+        .any(|c| program.contains(*c))
+}
+
+fn shell_escape(s: &str) -> String {
+    if s.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_./:=+".contains(ch)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 fn write_state(

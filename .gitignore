@@ -26,3 +26,4 @@ jobs/
 logs/
 run/
 target/
+release/

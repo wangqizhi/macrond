@@ -31,6 +31,25 @@ cargo build --release
 ./target/release/macrond
 ```
 
+自动打包（含校验和，产物统一放到 `release/`）：
+```bash
+./scripts/package.sh
+```
+
+打包后请从这里复制到目标目录：
+- `release/macrond`
+- 或 `release/macrond-<os>-<arch>.tar.gz`
+
+校验和文件：
+- `release/SHA256SUMS.txt`
+
+目标机自动处理脚本：
+- `release/install_macrond.sh`
+- 复制到目标目录后执行：
+```bash
+./install_macrond.sh
+```
+
 ## 3. 目录约定
 程序以 `--base-dir` 为根目录（默认当前目录 `.`）：
 - `jobs/`：任务配置（`*.json`）
