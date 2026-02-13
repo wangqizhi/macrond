@@ -1415,7 +1415,7 @@ fn visible_options(options: &[String], selected: usize, max_visible: usize) -> (
     }
     let half = max_visible / 2;
     let mut start = selected.saturating_sub(half);
-    let mut end = (start + max_visible).min(options.len());
+    let end = (start + max_visible).min(options.len());
     if end - start < max_visible {
         start = end.saturating_sub(max_visible);
     }
