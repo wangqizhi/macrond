@@ -5,9 +5,10 @@ use crate::paths::AppPaths;
 use crate::scheduler;
 use anyhow::{Context, Result, bail};
 use chrono::Local;
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use std::collections::HashMap;
@@ -81,8 +82,25 @@ struct InputState {
 
 #[derive(Clone)]
 enum InputKind {
-    Text { value: String, cursor: usize },
+    Text {
+        value: String,
+        cursor: usize,
+        suggest: Option<SuggestState>,
+    },
     Select { options: Vec<String>, selected: usize },
+}
+
+#[derive(Clone)]
+struct SuggestState {
+    options: Vec<String>,
+    selected: usize,
+    kind: SuggestKind,
+}
+
+#[derive(Clone)]
+enum SuggestKind {
+    WorkingDir { base: String },
+    ProgramPath { replace_start: usize, replace_end: usize },
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -389,17 +407,84 @@ impl UiState {
     fn on_key_edit(&mut self, paths: &AppPaths, key: KeyEvent, mut edit: EditState) -> Result<bool> {
         if let Some(mut input) = edit.input.take() {
             match &mut input.kind {
-                InputKind::Text { value, cursor } => match key.code {
+                InputKind::Text {
+                    value,
+                    cursor,
+                    suggest,
+                } => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        value.clear();
+                        *cursor = 0;
+                        *suggest = suggest_for_input(input.field, value, &edit.form.working_dir);
+                        edit.message = "Input cleared (Ctrl+C)".to_string();
+                        edit.input = Some(input);
+                    }
+                    KeyCode::Down => {
+                        if let Some(state) = suggest.as_mut() {
+                            if !state.options.is_empty() {
+                                state.selected = (state.selected + 1) % state.options.len();
+                                edit.input = Some(input);
+                                self.mode = UiMode::Edit(edit);
+                                return Ok(false);
+                            }
+                        }
+                        edit.input = Some(input);
+                    }
+                    KeyCode::Up => {
+                        if let Some(state) = suggest.as_mut() {
+                            if !state.options.is_empty() {
+                                if state.selected == 0 {
+                                    state.selected = state.options.len() - 1;
+                                } else {
+                                    state.selected -= 1;
+                                }
+                                edit.input = Some(input);
+                                self.mode = UiMode::Edit(edit);
+                                return Ok(false);
+                            }
+                        }
+                        edit.input = Some(input);
+                    }
                     KeyCode::Enter => {
+                        if let Some(state) = suggest.as_ref() {
+                            if !state.options.is_empty() {
+                                let chosen = state.options[state.selected].clone();
+                                apply_suggestion(value, state, &chosen);
+                                *cursor = value.len();
+                                *suggest = suggest_for_input(input.field, value, &edit.form.working_dir);
+                                edit.input = Some(input);
+                                self.mode = UiMode::Edit(edit);
+                                return Ok(false);
+                            }
+                        }
                         edit.apply_input(input.field, value.clone());
                     }
                     KeyCode::Esc => {
-                        edit.message = "Input canceled".to_string();
+                        if suggest.is_some() {
+                            *suggest = None;
+                            edit.input = Some(input);
+                        } else {
+                            edit.message = "Input canceled".to_string();
+                        }
                     }
                     KeyCode::Backspace => {
+                        let removed_char = if *cursor > 0 && *cursor <= value.len() {
+                            value.chars().nth(*cursor - 1)
+                        } else {
+                            None
+                        };
                         if *cursor > 0 && *cursor <= value.len() {
                             value.remove(*cursor - 1);
                             *cursor -= 1;
+                        }
+                        if let Some(ch) = removed_char {
+                            if should_cancel_suggest_on_delete(suggest.as_ref(), ch) {
+                                *suggest = None;
+                            } else {
+                                *suggest = suggest_for_input(input.field, value, &edit.form.working_dir);
+                            }
+                        } else {
+                            *suggest = suggest_for_input(input.field, value, &edit.form.working_dir);
                         }
                         edit.input = Some(input);
                     }
@@ -420,6 +505,7 @@ impl UiState {
                             value.insert(*cursor, c);
                             *cursor += 1;
                         }
+                        *suggest = suggest_for_input(input.field, value, &edit.form.working_dir);
                         edit.input = Some(input);
                     }
                     _ => {
@@ -527,9 +613,9 @@ impl EditState {
             }
         }
         fields.extend([
+            EditField::WorkingDir,
             EditField::Program,
             EditField::Args,
-            EditField::WorkingDir,
             EditField::EnvJson,
             EditField::Timeout,
         ]);
@@ -606,9 +692,14 @@ impl EditState {
             _ => {
                 let value = self.field_value(field);
                 let cursor = value.len();
+                let suggest = suggest_for_input(field, &value, &self.form.working_dir);
                 self.input = Some(InputState {
                     field,
-                    kind: InputKind::Text { value, cursor },
+                    kind: InputKind::Text {
+                        value,
+                        cursor,
+                        suggest,
+                    },
                 });
                 self.message = "Editing field... Enter=apply Esc=cancel".to_string();
             }
@@ -859,7 +950,7 @@ fn render(frame: &mut Frame<'_>, ui: &UiState) {
         }
         UiMode::Edit(edit) => {
             if edit.input.is_some() {
-                "Input mode: type text  Enter:apply  Backspace:delete  Esc:cancel\nEditor: j/k:move field  s:save  q/Esc:back"
+                "Input mode: type text  Ctrl+C:clear  Enter:apply  Backspace:delete  Esc:cancel\nEditor: j/k:move field  s:save  q/Esc:back"
             } else {
                 "Editor: j/k:move field  Enter:edit/toggle  s:save  q/Esc:back\nRepeat options: daily/weekly/monthly/everyminute/once"
             }
@@ -954,6 +1045,9 @@ fn render_list(frame: &mut Frame<'_>, area: ratatui::layout::Rect, ui: &UiState)
 }
 
 fn render_edit(frame: &mut Frame<'_>, area: ratatui::layout::Rect, edit: &EditState) {
+    let inner_width = area.width.saturating_sub(2);
+    let content_width = inner_width.saturating_sub(3);
+    let wrap_width = content_width.max(1) as usize;
     let fields = edit.fields();
     let selected = if fields.is_empty() {
         0
@@ -963,11 +1057,12 @@ fn render_edit(frame: &mut Frame<'_>, area: ratatui::layout::Rect, edit: &EditSt
     let mut state = ListState::default().with_selected(Some(selected));
 
     let mut items = Vec::new();
-    items.push(ListItem::new(format!("id (auto): {}", edit.form.id)));
+    items.push(ListItem::new(wrap_field_text("id (auto)", &edit.form.id, wrap_width)));
 
     for field in fields {
-        let line = format!("{}: {}", field_label(field), edit.field_value(field));
-        items.push(ListItem::new(line));
+        let label = field_label(field);
+        let value = edit.field_value(field);
+        items.push(ListItem::new(wrap_field_text(label, &value, wrap_width)));
     }
 
     let editor = List::new(items)
@@ -983,22 +1078,33 @@ fn render_edit(frame: &mut Frame<'_>, area: ratatui::layout::Rect, edit: &EditSt
     frame.render_stateful_widget(editor, area, &mut state);
 
     if let Some(input) = &edit.input {
-        let popup = centered_rect(80, 5, area);
         match &input.kind {
-            InputKind::Text { value, cursor } => {
-                let widget = Paragraph::new(format!(
-                    "Editing {}\n> {}",
-                    field_label(input.field),
-                    value
-                ))
-                .block(Block::default().title("Input").borders(Borders::ALL));
+            InputKind::Text {
+                value,
+                cursor,
+                suggest,
+            } => {
+                let popup_width = area.width.saturating_mul(80).saturating_div(100).max(10);
+                let inner_width = popup_width.saturating_sub(2).max(1) as usize;
+                let (text, cursor_pos) = wrap_input_text(field_label(input.field), value, *cursor, inner_width);
+                let content_lines = text.lines.len().max(2);
+                let popup_height = (content_lines + 2).min(area.height as usize).max(4) as u16;
+                let popup = centered_rect_with_width(popup_width, popup_height, area);
+
+                let widget = Paragraph::new(text)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(Block::default().title("Input").borders(Borders::ALL));
                 frame.render_widget(widget, popup);
-                let cursor_x = popup
-                    .x
-                    .saturating_add(3)
-                    .saturating_add(*cursor as u16);
-                let cursor_y = popup.y.saturating_add(2);
-                frame.set_cursor_position((cursor_x, cursor_y));
+                if let Some((cursor_x, cursor_y)) = cursor_pos {
+                    frame.set_cursor_position((
+                        popup.x.saturating_add(1).saturating_add(cursor_x),
+                        popup.y.saturating_add(1).saturating_add(cursor_y),
+                    ));
+                }
+
+                if let Some(state) = suggest {
+                    render_suggest_list(frame, area, popup, state);
+                }
             }
             InputKind::Select { options, selected } => {
                 let mut lines = vec![format!("Select {}", field_label(input.field))];
@@ -1016,6 +1122,361 @@ fn render_edit(frame: &mut Frame<'_>, area: ratatui::layout::Rect, edit: &EditSt
             }
         }
     }
+}
+
+fn wrap_field_text(label: &str, value: &str, width: usize) -> Text<'static> {
+    let prefix = format!("{label}: ");
+    let indent = " ".repeat(prefix.len());
+    if value.is_empty() {
+        return Text::from(vec![Line::from(prefix)]);
+    }
+
+    let first_width = width.saturating_sub(prefix.len()).max(1);
+    let rest_width = width.saturating_sub(indent.len()).max(1);
+    let (first, rest) = split_at_chars(value, first_width);
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!("{prefix}{first}")));
+    for chunk in split_chunks(&rest, rest_width) {
+        lines.push(Line::from(format!("{indent}{chunk}")));
+    }
+    Text::from(lines)
+}
+
+fn wrap_input_text(label: &str, value: &str, cursor: usize, width: usize) -> (Text<'static>, Option<(u16, u16)>) {
+    let title = format!("Editing {label}");
+    let hint = if label == "program" {
+        "Ctrl+C clear  @ browse files".to_string()
+    } else {
+        "Ctrl+C clear".to_string()
+    };
+    let prefix = "> ".to_string();
+    let indent = "  ".to_string();
+    let first_width = width.saturating_sub(prefix.len()).max(1);
+    let rest_width = width.saturating_sub(indent.len()).max(1);
+
+    let cursor_chars = value.get(0..cursor).unwrap_or(value).chars().count();
+    let (first, rest) = split_at_chars(value, first_width);
+    let mut lines = Vec::new();
+    lines.push(Line::from(title));
+    lines.push(Line::from(hint));
+    lines.push(Line::from(format!("{prefix}{first}")));
+    for chunk in split_chunks(&rest, rest_width) {
+        lines.push(Line::from(format!("{indent}{chunk}")));
+    }
+
+    let (cursor_line, cursor_col) = if cursor_chars <= first_width {
+        (2, prefix.len() + cursor_chars)
+    } else {
+        let remaining = cursor_chars - first_width;
+        let line_offset = remaining / rest_width + 1;
+        let col = indent.len() + (remaining % rest_width);
+        (2 + line_offset, col)
+    };
+
+    let cursor_pos = Some((cursor_col as u16, cursor_line as u16));
+    (Text::from(lines), cursor_pos)
+}
+
+fn suggest_for_input(field: EditField, value: &str, working_dir: &str) -> Option<SuggestState> {
+    match field {
+        EditField::WorkingDir => working_dir_suggest(value),
+        EditField::Program => program_path_suggest(value, working_dir),
+        _ => None,
+    }
+}
+
+fn working_dir_suggest(value: &str) -> Option<SuggestState> {
+    if !value.starts_with('/') {
+        return None;
+    }
+
+    let (base, prefix) = match value.rfind('/') {
+        Some(idx) => (value[..=idx].to_string(), value[idx + 1..].to_string()),
+        None => ("/".to_string(), value.to_string()),
+    };
+    let dir = Path::new(&base);
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut options = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if !prefix.is_empty() && !name.starts_with(&prefix) {
+                continue;
+            }
+            options.push(name.to_string());
+        }
+    }
+
+    if options.is_empty() {
+        return None;
+    }
+    options.sort();
+    Some(SuggestState {
+        options,
+        selected: 0,
+        kind: SuggestKind::WorkingDir { base },
+    })
+}
+
+fn program_path_suggest(value: &str, working_dir: &str) -> Option<SuggestState> {
+    let at_pos = value.rfind('@')?;
+    let after_at = &value[at_pos + 1..];
+    let base_dir = if working_dir.trim().is_empty() {
+        Path::new(".")
+    } else {
+        Path::new(working_dir)
+    };
+    if !base_dir.is_dir() {
+        return None;
+    }
+
+    let search_root = base_dir.to_path_buf();
+    let mut options = Vec::new();
+    let mut count = 0usize;
+    list_files_recursive(&search_root, &search_root, &mut options, &mut count, 300);
+    let query = after_at.to_lowercase();
+    options.retain(|path| {
+        if !is_program_candidate(path) {
+            return false;
+        }
+        if query.is_empty() {
+            return true;
+        }
+        path.to_lowercase().contains(&query)
+    });
+    if options.is_empty() {
+        return None;
+    }
+    options.sort();
+
+    Some(SuggestState {
+        options,
+        selected: 0,
+        kind: SuggestKind::ProgramPath {
+            replace_start: at_pos,
+            replace_end: at_pos + 1 + after_at.len(),
+        },
+    })
+}
+
+fn is_program_candidate(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext.is_empty() {
+        return true;
+    }
+    if matches!(
+        ext.as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "svg"
+            | "ico"
+            | "json"
+            | "txt"
+            | "md"
+            | "csv"
+            | "tsv"
+            | "log"
+            | "lock"
+            | "map"
+            | "pdf"
+            | "zip"
+            | "gz"
+            | "tar"
+            | "rar"
+            | "7z"
+    ) {
+        return false;
+    }
+    matches!(
+        ext.as_str(),
+        "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "py"
+            | "rb"
+            | "pl"
+            | "php"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "lua"
+            | "go"
+            | "rs"
+            | "swift"
+            | "ps1"
+            | "cmd"
+            | "bat"
+    )
+}
+
+fn list_files_recursive(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<String>,
+    count: &mut usize,
+    limit: usize,
+) {
+    if *count >= limit {
+        return;
+    }
+    let entries = match fs::read_dir(current) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if *count >= limit {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            list_files_recursive(root, &path, out, count, limit);
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                out.push(rel);
+                *count += 1;
+            }
+        }
+    }
+}
+
+fn apply_suggestion(value: &mut String, state: &SuggestState, chosen: &str) {
+    match &state.kind {
+        SuggestKind::WorkingDir { base } => {
+            *value = format!("{}{}/", base, chosen);
+        }
+        SuggestKind::ProgramPath {
+            replace_start,
+            replace_end,
+        } => {
+            let start = (*replace_start).min(value.len());
+            let end = (*replace_end).min(value.len());
+            let mut out = String::new();
+            out.push_str(&value[..start]);
+            out.push_str(chosen);
+            out.push_str(&value[end..]);
+            *value = out;
+        }
+    }
+}
+
+fn should_cancel_suggest_on_delete(suggest: Option<&SuggestState>, ch: char) -> bool {
+    match suggest.map(|s| &s.kind) {
+        Some(SuggestKind::WorkingDir { .. }) => ch == '/',
+        Some(SuggestKind::ProgramPath { .. }) => ch == '@',
+        None => false,
+    }
+}
+
+fn render_suggest_list(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    popup: ratatui::layout::Rect,
+    state: &SuggestState,
+) {
+    if state.options.is_empty() {
+        return;
+    }
+    let max_visible = 8usize;
+    let (visible, selected) = visible_options(&state.options, state.selected, max_visible);
+    let list_height = (visible.len() + 2).max(3) as u16;
+    let rect = dropdown_rect(popup, area, list_height);
+
+    let items: Vec<ListItem<'_>> = visible.into_iter().map(ListItem::new).collect();
+    let mut list_state = ListState::default().with_selected(Some(selected));
+    let widget = List::new(items)
+        .block(Block::default().title("Dirs").borders(Borders::ALL))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol(" > ");
+    frame.render_stateful_widget(widget, rect, &mut list_state);
+}
+
+fn visible_options(options: &[String], selected: usize, max_visible: usize) -> (Vec<String>, usize) {
+    if options.len() <= max_visible {
+        return (options.to_vec(), selected);
+    }
+    let half = max_visible / 2;
+    let mut start = selected.saturating_sub(half);
+    let mut end = (start + max_visible).min(options.len());
+    if end - start < max_visible {
+        start = end.saturating_sub(max_visible);
+    }
+    let slice = options[start..end].to_vec();
+    let selected = selected.saturating_sub(start);
+    (slice, selected)
+}
+
+fn dropdown_rect(
+    popup: ratatui::layout::Rect,
+    area: ratatui::layout::Rect,
+    height: u16,
+) -> ratatui::layout::Rect {
+    let height = height.min(area.height).max(3);
+    let below_space = area.y + area.height - (popup.y + popup.height);
+    let above_space = popup.y.saturating_sub(area.y);
+    let y = if below_space >= height {
+        popup.y + popup.height
+    } else if above_space >= height {
+        popup.y.saturating_sub(height)
+    } else {
+        popup.y + popup.height
+    };
+
+    let mut rect = ratatui::layout::Rect {
+        x: popup.x,
+        y,
+        width: popup.width,
+        height,
+    };
+
+    if rect.y + rect.height > area.y + area.height {
+        rect.y = area.y + area.height - rect.height;
+    }
+    rect
+}
+
+fn split_at_chars(s: &str, count: usize) -> (String, String) {
+    let mut iter = s.chars();
+    let head: String = iter.by_ref().take(count).collect();
+    let tail: String = iter.collect();
+    (head, tail)
+}
+
+fn split_chunks(s: &str, width: usize) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in s.chars() {
+        if current.chars().count() >= width {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn field_label(field: EditField) -> &'static str {
@@ -1067,6 +1528,19 @@ fn split_args(s: &str) -> Vec<String> {
 
 fn centered_rect(percent_x: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let width = area.width.saturating_mul(percent_x).saturating_div(100);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    ratatui::layout::Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn centered_rect_with_width(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let width = width.min(area.width).max(3);
+    let height = height.min(area.height).max(3);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     ratatui::layout::Rect {

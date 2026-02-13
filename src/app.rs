@@ -1,4 +1,4 @@
-use crate::cli::{Cli, Command};
+ause crate::cli::{Cli, Command};
 use crate::config;
 use crate::daemon;
 use crate::model::DaemonState;
